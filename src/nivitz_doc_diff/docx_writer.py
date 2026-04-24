@@ -9,7 +9,7 @@ from docx.enum.text import WD_COLOR_INDEX
 from docx.oxml.ns import qn
 from lxml import etree
 
-from .diff_engine import DiffOp
+from .diff_engine import DiffOp, DocDiffOp
 
 
 def ensure_rpr(run):
@@ -20,11 +20,8 @@ def ensure_rpr(run):
     return rpr
 
 
-def apply_highlight(run, color_index):
-    """Apply background highlight color to a run.
-
-    color_index should be a WD_COLOR_INDEX enum value (e.g. WD_COLOR_INDEX.YELLOW).
-    """
+def apply_highlight(run, color_index=WD_COLOR_INDEX.YELLOW):
+    """Apply background highlight color to a run."""
     rpr = ensure_rpr(run)
     hl = rpr.find(qn("w:highlight"))
     if hl is None:
@@ -43,59 +40,77 @@ def apply_strikethrough(run):
     return run
 
 
-def add_formatted_text(paragraph, text: str, is_highlighted: bool = False, is_strikethrough: bool = False):
+def _add_formatted_text(paragraph, text: str, *, highlight: bool = False, strikethrough: bool = False):
     """Add a run to a paragraph with optional highlighting and/or strikethrough."""
+    if not text:
+        return None
     run = paragraph.add_run(text)
-    if is_highlighted:
-        apply_highlight(run, WD_COLOR_INDEX.YELLOW)
-    if is_strikethrough:
+    if highlight:
+        apply_highlight(run)
+    if strikethrough:
         apply_strikethrough(run)
     return run
 
 
-def build_diff_document(
-    diff_results: list[list[DiffOp]],
-    output_path: str | Path,
-) -> None:
+def _render_word_ops(paragraph, word_ops: list[DiffOp]) -> None:
+    """Render a list of word-level diff ops into a paragraph."""
+    for op in word_ops:
+        if op.kind == "equal":
+            _add_formatted_text(paragraph, op.new_text)
+        elif op.kind == "insert":
+            _add_formatted_text(paragraph, op.new_text, highlight=True)
+        elif op.kind == "delete":
+            _add_formatted_text(paragraph, op.old_text, strikethrough=True)
+        elif op.kind == "replace":
+            # Show deleted (strikethrough) then inserted (highlighted)
+            _add_formatted_text(paragraph, op.old_text, strikethrough=True)
+            _add_formatted_text(paragraph, op.new_text, highlight=True)
+
+
+def build_diff_document(diff_results, output_path: str | Path) -> None:
     """Build a .docx file from diff results.
 
-    For each paragraph slot we have a list of DiffOps. The output document
-    shows the current (new) text, with:
-    - Replaced/new text → highlighted
-    - Replaced/old text → strikethrough
-    - Equal text → unchanged
-    - Insert-only text → highlighted
-    - Delete-only text → strikethrough
+    Accepts either:
+      - list[DocDiffOp]  (v0.2+ API, paragraph-level alignment)
+      - list[list[DiffOp]]  (v0.1 legacy API, index-based alignment)
 
-    Deleted-only text is appended inline (as a strikethrough run) so readers
-    can see what was removed in context.
+    The legacy path is preserved for backwards compatibility with older tests.
     """
     doc = Document()
 
-    for para_ops in diff_results:
-        para = doc.add_paragraph()
-        for op in para_ops:
-            if op.kind == "equal":
-                # Copy unchanged text as a plain run
-                if op.new_text:
-                    add_formatted_text(para, op.new_text)
-            elif op.kind == "insert":
-                # New text → highlighted
-                if op.new_text:
-                    add_formatted_text(para, op.new_text, is_highlighted=True)
-            elif op.kind == "delete":
-                # Deleted text → strikethrough
-                if op.old_text:
-                    add_formatted_text(para, op.old_text, is_strikethrough=True)
-            elif op.kind == "replace":
-                # Show deleted (strikethrough) then inserted (highlighted)
-                if op.old_text:
-                    add_formatted_text(para, op.old_text, is_strikethrough=True)
-                if op.new_text:
-                    add_formatted_text(para, op.new_text, is_highlighted=True)
+    # Detect which API we're dealing with
+    is_new_api = diff_results and isinstance(diff_results[0], DocDiffOp)
+    is_legacy_api = diff_results and isinstance(diff_results[0], list)
 
-        # If paragraph has no runs, add an empty run to ensure the paragraph exists
-        if not para.runs:
-            add_formatted_text(para, "")
+    if is_new_api:
+        for doc_op in diff_results:
+            para = doc.add_paragraph()
+            if doc_op.kind == "equal":
+                new_p = doc_op.new_paragraph
+                _add_formatted_text(para, new_p.full_text if new_p else "")
+            elif doc_op.kind == "insert":
+                new_p = doc_op.new_paragraph
+                _add_formatted_text(para, new_p.full_text if new_p else "", highlight=True)
+            elif doc_op.kind == "delete":
+                old_p = doc_op.old_paragraph
+                _add_formatted_text(para, old_p.full_text if old_p else "", strikethrough=True)
+            elif doc_op.kind == "replace":
+                _render_word_ops(para, doc_op.word_ops)
+
+            # Ensure paragraph has at least one run
+            if not para.runs:
+                _add_formatted_text(para, "")
+
+    elif is_legacy_api:
+        # v0.1 API: list[list[DiffOp]] — each sublist is one paragraph's word ops
+        for para_ops in diff_results:
+            para = doc.add_paragraph()
+            _render_word_ops(para, para_ops)
+            if not para.runs:
+                _add_formatted_text(para, "")
+
+    else:
+        # Empty diff: empty document
+        pass
 
     doc.save(str(output_path))
